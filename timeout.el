@@ -57,9 +57,25 @@
 
 ;;; Code:
 (require 'nadvice)
+(require 'cl-generic)
 
 (define-obsolete-function-alias 'timeout-throttle! 'timeout-throttle "v2.0")
 (define-obsolete-function-alias 'timeout-debounce! 'timeout-debounce "v2.0")
+
+(oclosure-define timeout
+  "Timeout closure."
+  type func delay
+  (timer :mutable t)
+  (default :mutable t)
+  (args :mutable t))
+
+(cl-defmethod function-documentation ((fun timeout))
+  (concat (documentation (timeout--func fun))
+          "\n\n"
+          (if (eq (timeout--type fun) 'debounce)
+              "Debounce"
+            "Throttle")
+          " calls to this function"))
 
 (defsubst timeout--eval-value (value)
   "Eval a VALUE.
@@ -71,60 +87,49 @@ symbol, return its value.  Else return itself."
         ((and (symbolp value) (boundp value)) (symbol-value value))
         (t (error "Invalid value %s" value))))
 
-(defun timeout--throttle-advice (&optional timeout)
-  "Return a function that throttles its argument function.
-
-For the meaning of TIMEOUT see `timeout-throttle'.
-
-When FUNC does not run because of the throttle, the result from the
-previous successful call is returned.
-
-This is intended for use as function advice."
-  (let ((throttle-timer)
-        (timeout-value (or timeout 1.0))
-        (result))
-    (lambda (orig-fn &rest args)
-      "Throttle calls to this function."
-      (progn
-        (unless (and throttle-timer (timerp throttle-timer))
-          (setq result (apply orig-fn args))
-          (setq throttle-timer
-                (run-with-timer
-                 (timeout--eval-value timeout-value) nil
-                 (lambda ()
-                   (cancel-timer throttle-timer)
-                   (setq throttle-timer nil)))))
-        result))))
-
-(defun timeout--debounce-advice (&optional delay default)
-  "Return a function that debounces its argument function.
-
-For the meaning of DELAY see `timeout-debounce'.
-
-The function returns immediately with value DEFAULT when called the
-first time.  On future invocations, the result from the previous call is
-returned.
-
-This is intended for use as function advice."
-  (let ((debounce-timer nil)
-        (delay-value (or delay 0.50)))
-    (lambda (orig-fn &rest args)
-      "Debounce calls to this function."
-      (prog1 default
-        (if (timerp debounce-timer)
-            (timer-set-idle-time debounce-timer (timeout--eval-value delay-value))
-          (setq debounce-timer
-                (run-with-idle-timer
-                 (timeout--eval-value delay-value) nil
-                 (lambda (buf)
-                   (cancel-timer debounce-timer)
-                   (setq debounce-timer nil)
-                   (setq default
-                         (if (buffer-live-p buf)
-                             (with-current-buffer buf
-                               (apply orig-fn args))
-                           (apply orig-fn args))))
-                 (current-buffer))))))))
+(defmacro timeout--lambda (type func delay &optional default interactive)
+  "Create a timeout lambda for FUNC with DELAY.
+TYPE is \\='throttle or \\='debounce. If INTERACTIVE is non-nil, create
+a command."
+  `(oclosure-lambda
+       (timeout (type ,type) (func ,func) (delay ,delay)
+                (timer (timer-create)) (default ,default) (args nil))
+       (&rest new-args)
+     ,(when interactive
+        '(interactive (advice-eval-interactive-spec
+                       (cadr (interactive-form func)))))
+     ,(if (eq type 'throttle)
+          `(progn
+             (unless (memq timer timer-list)
+               (setq default (apply func new-args))
+               (timer-set-time
+                timer
+                (timer-relative-time nil
+                                     (timeout--eval-value
+                                      delay)))
+               (timer-set-function timer #'ignore)
+               (timer-activate timer))
+             default)
+        ;; debounce
+        `(prog1 default
+           (setq args new-args)
+           (when (memq timer timer-list)
+             (cancel-timer timer))
+           (timer-set-time
+            timer
+            (timer-relative-time nil
+                                 (timeout--eval-value
+                                  delay)))
+           (timer-set-function
+            timer
+            (lambda (buf)
+              (setq default
+                    (if (buffer-live-p buf)
+                        (with-current-buffer buf
+                          (apply func args))
+                      (apply func args))))
+            (list (current-buffer)))
+           (timer-activate timer)))))
 
 ;;;###autoload
 (defun timeout-debounce (func &optional delay default)
@@ -143,77 +148,38 @@ The function returns immediately with value DEFAULT when called the
 first time.  On future invocations, the result from the previous call is
 returned."
   (if (and delay (eq delay 0))
-      (advice-remove func 'debounce)
-    (advice-add func :around (timeout--debounce-advice delay default)
-                '((name . debounce)
-                  (depth . -99)))))
+      (progn
+        (when-let* ((ad  (advice-member-p 'debounce func))
+                    (_   (eq (oclosure-type ad) 'timeout))
+                    (tmr (timeout--timer ad))
+                    (_   (memq tmr timer-list)))
+          (cancel-timer tmr))
+        (advice-remove func 'debounce))
+    (let ((ad (timeout--lambda 'debounce func (or delay 0.50) default)))
+      (advice-add func :around ad
+                  `((name . debounce)
+                    (depth . -99)))
+      ad)))
 
 ;;;###autoload
 (defun timeout-throttle (func &optional throttle)
   "Make FUNC run no more frequently than once every THROTTLE seconds.
 
-THROTTLE defaults to 1 second.  THROTTLE can be a number, a symbol (whose
-value is a number), or a function (that evaluates to a number).  When
-passed a symbol or function, it is evaluated at runtime for dynamic
-duration.  Using a throttle of 0 removes any throttle advice.
+THROTTLE defaults to 1 second.  THROTTLE can be a number, a
+symbol (whose value is a number), or a function (that evaluates to a
+number).  When passed a symbol or function, it is evaluated at runtime
+for dynamic duration.  Using a throttle of 0 removes any throttle
+advice.
 
 When FUNC does not run because of the throttle, the result from the
 previous successful call is returned."
   (if (and throttle (eq throttle 0))
       (advice-remove func 'throttle)
-    (advice-add func :around (timeout--throttle-advice throttle)
-                '((name . throttle)
-                  (depth . -98)))))
-
-(defun timeout-throttled-func (func &optional throttle)
-  "Return a throttled version of function FUNC.
-
-The throttled function runs no more frequently than once every THROTTLE
-seconds.  THROTTLE defaults to 1 second.  THROTTLE can be a number, a
-symbol (whose value is a number), or a function (that evaluates to a
-number).  When passed a symbol or function, it is evaluated at runtime
-for dynamic duration.
-
-When FUNC does not run because of the throttle, the result from the
-previous successful call is returned."
-  (let ((throttle-timer nil)
-        (throttle-value (or throttle 1))
-        (result))
-    (if (commandp func)
-        ;; INTERACTIVE version
-        (lambda (&rest args)
-          (:documentation
-           (concat
-            (documentation func)
-            "\n\nThrottle calls to this function"))
-          (interactive (advice-eval-interactive-spec
-                        (cadr (interactive-form func))))
-          (progn
-            (unless (and throttle-timer (timerp throttle-timer))
-              (setq result (apply func args))
-              (setq throttle-timer
-                    (run-with-timer
-                     (timeout--eval-value throttle-value) nil
-                     (lambda ()
-                       (cancel-timer throttle-timer)
-                       (setq throttle-timer nil)))))
-            result))
-      ;; NON-INTERACTIVE version
-      (lambda (&rest args)
-        (:documentation
-         (concat
-          (documentation func)
-          "\n\nThrottle calls to this function"))
-        (progn
-          (unless (and throttle-timer (timerp throttle-timer))
-            (setq result (apply func args))
-            (setq throttle-timer
-                  (run-with-timer
-                   (timeout--eval-value throttle-value) nil
-                   (lambda ()
-                     (cancel-timer throttle-timer)
-                     (setq throttle-timer nil)))))
-          result)))))
+    (let ((ad (timeout--lambda 'throttle func (or throttle 1.0))))
+      (advice-add func :around ad
+                  `((name . throttle)
+                    (depth . -98)))
+      ad)))
 
 (defun timeout-debounced-func (func &optional delay default)
   "Return a debounced version of function FUNC.
@@ -226,53 +192,20 @@ a symbol or function, it is evaluated at runtime for dynamic duration.
 The function returns immediately with value DEFAULT when called the
 first time.  On future invocations, the result from the previous call is
 returned."
-  (let ((debounce-timer nil)
-        (delay-value (or delay 0.50)))
-    (if (commandp func)
-        ;; INTERACTIVE version
-        (lambda (&rest args)
-          (:documentation
-           (concat
-            (documentation func)
-            "\n\nDebounce calls to this function"))
-          (interactive (advice-eval-interactive-spec
-                        (cadr (interactive-form func))))
-          (prog1 default
-            (if (timerp debounce-timer)
-                (timer-set-idle-time debounce-timer (timeout--eval-value delay-value))
-              (setq debounce-timer
-                    (run-with-idle-timer
-                     (timeout--eval-value delay-value) nil
-                     (lambda (buf)
-                       (cancel-timer debounce-timer)
-                       (setq debounce-timer nil)
-                       (setq default
-                             (if (buffer-live-p buf)
-                                 (with-current-buffer buf
-                                   (apply func args))
-                               (apply func args))))
-                     (current-buffer))))))
-      ;; NON-INTERACTIVE version
-      (lambda (&rest args)
-        (:documentation
-         (concat
-          (documentation func)
-          "\n\nDebounce calls to this function"))
-        (prog1 default
-          (if (timerp debounce-timer)
-              (timer-set-idle-time debounce-timer (timeout--eval-value delay-value))
-            (setq debounce-timer
-                  (run-with-idle-timer
-                   (timeout--eval-value delay-value) nil
-                   (lambda (buf)
-                     (cancel-timer debounce-timer)
-                     (setq debounce-timer nil)
-                     (setq default
-                           (if (buffer-live-p buf)
-                               (with-current-buffer buf
-                                 (apply func args))
-                             (apply func args))))
-                   (current-buffer)))))))))
+  (timeout--lambda 'debounce func (or delay 0.50) default (commandp func)))
+
+(defun timeout-throttled-func (func &optional throttle)
+  "Return a throttled version of function FUNC.
+
+The throttled function runs no more frequently than once every THROTTLE
+seconds.  THROTTLE defaults to 1 second.  THROTTLE can be a number, a
+symbol (whose value is a number), or a function (that evaluates to a
+number).  When passed a symbol or function, it is evaluated at runtime
+for dynamic duration.
+
+When FUNC does not run because of the throttle, the result from the
+previous successful call is returned."
+  (timeout--lambda 'throttle func (or throttle 1.0) nil (commandp func)))
 
 (provide 'timeout)
 ;;; timeout.el ends here
