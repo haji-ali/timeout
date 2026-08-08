@@ -68,6 +68,7 @@
   (timer :mutable t)
   (default :mutable t)
   (args :mutable t)
+  (last-error :mutable t)
   doc)
 
 (cl-defmethod function-documentation ((fun timeout))
@@ -109,19 +110,27 @@ DEFAULT is the default value to initialize."
          (body
           (pcase type
             ('throttle
-             `(progn
-                (unless (memq timer timer-list)
-                  (setq default (apply ,call-fun new-args))
-                  (timer-set-time
-                   timer
-                   (timer-relative-time nil
-                                        (timeout--eval-value delay)))
-                  (timer-set-function timer #'ignore)
-                  (timer-activate timer))
-                default))
+             `(if (memq timer timer-list)
+                  (if last-error
+                      (signal (car last-error) (cdr last-error))
+                    default)
+                ;; Activate the throttle window before calling FUNC, so
+                ;; that an error from FUNC does not leave the function
+                ;; unthrottled.
+                (timer-set-time
+                 timer
+                 (timer-relative-time nil
+                                      (timeout--eval-value delay)))
+                (timer-set-function timer #'ignore)
+                (timer-activate timer)
+                (condition-case err
+                    (prog1 (setq default (apply ,call-fun new-args))
+                      (setq last-error nil))
+                  (error (setq last-error err)
+                         (signal (car err) (cdr err))))))
 
             ('debounce
-             `(prog1 default
+             `(progn
                 (setq args new-args)
                 (when (memq timer timer-list)
                   (cancel-timer timer))
@@ -132,13 +141,24 @@ DEFAULT is the default value to initialize."
                 (timer-set-function
                  timer
                  (lambda (buf)
-                   (setq default
-                         (if (buffer-live-p buf)
-                             (with-current-buffer buf
+                   (condition-case err
+                       (setq default
+                             (if (buffer-live-p buf)
+                                 (with-current-buffer buf
+                                   (apply ,call-fun args))
                                (apply ,call-fun args))
-                           (apply ,call-fun args))))
+                             last-error nil)
+                     (error (setq last-error err)
+                            (signal (car err) (cdr err)))))
                  (list (current-buffer)))
-                (timer-activate timer)))
+                (timer-activate timer)
+                ;; Debouncing always succeeds (the call is still scheduled
+                ;; to run after DELAY).  But if the value we would
+                ;; normally return here is stale because the last
+                ;; scheduled call errored, rethrow that error instead.
+                (if last-error
+                    (signal (car last-error) (cdr last-error))
+                  default)))
             (_ (error "Invalid timeout type: %S" type)))))
     `(oclosure-lambda
          (timeout
@@ -148,6 +168,7 @@ DEFAULT is the default value to initialize."
           (timer (timer-create))
           (default ,default)
           (args nil)
+          (last-error nil)
           (doc (documentation ,func)))
          ,arglist
        ,interactive-form
